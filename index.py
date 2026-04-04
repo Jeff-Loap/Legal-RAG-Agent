@@ -2,8 +2,14 @@
 import json
 import os
 import pickle
+
 import numpy as np
 import faiss
+
+from legal_agent.runtime_env import configure_local_ml_runtime
+
+configure_local_ml_runtime()
+
 from sentence_transformers import SentenceTransformer
 
 CHUNKS_JSONL = r"D:\PythonFile\JCAI\RAG\agent_guide_chunks.jsonl"

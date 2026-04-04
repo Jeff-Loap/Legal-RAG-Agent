@@ -29,7 +29,7 @@ flowchart TD
 
         U --> ROUTE{"问题路由"}
         ROUTE -->|general| G["通用对话 LLM（不走法律检索）"]
-        ROUTE -->|legal| PLAN["检索规划（quality模式启用）: 法律改写 + 法域路由 + 多争点拆解"]
+        ROUTE -->|legal| PLAN["检索规划: 法律改写 + 法域路由 + 多争点拆解"]
 
         PLAN --> MODE{"检索模式"}
         MODE -->|默认: llm_retrieval| L1["本地宽召回候选"]
@@ -48,7 +48,7 @@ flowchart TD
         R1 --> GEN
         R2 --> GEN
 
-        GEN --> CHECK["回答后处理（quality模式）: 自检 + 引用一致性校验"]
+        GEN --> CHECK["回答后处理: 自检 + 引用一致性校验"]
         CHECK --> STREAM["流式输出: thinking + answer"]
         STREAM --> CITE["引用展示 + PDF页内预览"]
         STREAM --> SAVE["写回历史并打 memory_group/keywords"]
@@ -71,10 +71,9 @@ flowchart TD
 2. 更早历史不全量拼接，而是按 `memory_group` 外层过滤，再做组内记忆检索。
 3. 记忆召回受 `relevance` 阈值控制，降低噪声历史干扰。
 
-### 3.3 提示词工程链路（按档位）
+### 3.3 提示词工程链路
 
-1. `fast`：保留核心问答链路，跳过改写/自检/引用一致性校验，优先速度。
-2. `quality`：启用法律改写、法域路由、多争点拆解、回答后自检、引用一致性校验，优先准确性。
+系统已固定为 `quality` 策略：启用法律改写、法域路由、多争点拆解、回答后自检、引用一致性校验，优先准确性。
 
 ## 4. 输出与可信性
 

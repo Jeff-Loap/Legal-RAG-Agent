@@ -9,6 +9,11 @@ from typing import Any
 
 import faiss
 import numpy as np
+
+from .runtime_env import configure_local_ml_runtime
+
+configure_local_ml_runtime()
+
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from .config import AppConfig, get_default_config
@@ -796,7 +801,7 @@ def extract_query_terms(query: str) -> set[str]:
 
 def extract_priority_legal_terms(query: str) -> list[str]:
     terms = re.findall(
-        r"(正当防卫|防卫过当|特殊防卫|紧急避险|强奸|抢劫|杀人|绑架|行凶|侮辱罪|诽谤罪|侮辱|诽谤|名誉权|肖像权|人格权|深度伪造|换脸|AI换脸|审核义务|通知删除|知道或者应当知道|网络侵权|网络服务提供者|连带责任|拒不履行信息网络安全管理义务罪|非法利用信息网络罪|帮助信息网络犯罪活动罪|民事责任|刑事责任|行政处罚|治安处罚|个人信息|劳动合同|危险化学品)",
+        r"(正当防卫|防卫过当|特殊防卫|紧急避险|强奸|抢劫|杀人|绑架|行凶|侮辱罪|诽谤罪|侮辱|诽谤|名誉权|肖像权|人格权|深度伪造|换脸|AI换脸|审核义务|通知删除|知道或者应当知道|网络侵权|网络服务提供者|连带责任|拒不履行信息网络安全管理义务罪|非法利用信息网络罪|帮助信息网络犯罪活动罪|民事责任|刑事责任|行政处罚|治安处罚|个人信息|劳动合同|劳动合同法|劳动法|试用期|离职|解除劳动合同|提前通知|通知用人单位|道路交通安全法|道路交通安全|交通安全|交通管理|公安机关交通管理部门|国务院公安部门|危险化学品)",
         query,
     )
     for block in re.findall(r"[\u4e00-\u9fff]{4,}", query):
@@ -813,6 +818,7 @@ def extract_priority_legal_terms(query: str) -> list[str]:
             enriched_terms.append("侮辱")
         if term == "诽谤罪":
             enriched_terms.append("诽谤")
+    enriched_terms.extend(_extract_legal_subterms(query, max_terms=36))
     for term in sorted(enriched_terms, key=len, reverse=True):
         if term in seen:
             continue
@@ -1022,7 +1028,7 @@ def _extract_legal_subterms(
                     continue
                 if token in {"可能", "大量", "平台", "传播", "承担", "义务", "责任"}:
                     continue
-                if not re.search(r"(罪|法|权|责|刑|民|侵|审|赔|罚|防卫|诽谤|侮辱|名誉|肖像|隐私|网络)", token):
+                if not re.search(r"(罪|法|权|责|刑|民|侵|审|赔|罚|防卫|诽谤|侮辱|名誉|肖像|隐私|网络|劳动|合同|试用|离职|通知|用人|工资|工伤|社保|仲裁|道路|交通|公安|机关|驾驶|车辆|安全)", token):
                     continue
                 seen.add(normalized)
                 terms.append(token)
@@ -1092,6 +1098,31 @@ def _expand_query_alias_terms(query: str) -> list[str]:
                 "AI换脸",
                 "个人信息保护法",
                 "网络安全法",
+            ]
+        )
+    if re.search(r"(试用期|离职|解除劳动合同|通知用人单位|提前几天通知)", text):
+        terms.extend(
+            [
+                "中华人民共和国劳动合同法",
+                "劳动合同法",
+                "试用期",
+                "离职",
+                "解除劳动合同",
+                "提前通知",
+                "通知用人单位",
+                "第三十七条",
+            ]
+        )
+    if re.search(r"(道路交通|交通安全|交通管理|公安机关交通管理部门|国务院公安部门|驾驶证|机动车)", text):
+        terms.extend(
+            [
+                "中华人民共和国道路交通安全法",
+                "道路交通安全法",
+                "道路交通安全管理",
+                "交通管理",
+                "公安机关交通管理部门",
+                "国务院公安部门",
+                "第五条",
             ]
         )
     return terms

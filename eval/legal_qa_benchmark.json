@@ -1,0 +1,107 @@
+[
+  {
+    "id": "criminal_special_defense",
+    "question": "路人甲为制止正在进行的强奸行为将施暴者打成重伤，这种情况属于正当防卫还是防卫过当？",
+    "expected_scope": "legal",
+    "expected_references": [
+      {
+        "source_name": "中华人民共和国刑法_20201226.pdf",
+        "article_anchor": "第二十条"
+      }
+    ],
+    "answer_checks": {
+      "must_include_any": [
+        ["正当防卫", "特殊防卫"],
+        ["第二十条", "刑法第二十条"],
+        ["不负刑事责任", "不承担刑事责任"]
+      ],
+      "must_exclude_all": [
+        "应当承担刑事责任"
+      ]
+    }
+  },
+  {
+    "id": "civil_self_defense",
+    "question": "因正当防卫造成损害，是否需要承担民事责任？",
+    "expected_scope": "legal",
+    "expected_references": [
+      {
+        "source_name": "中华人民共和国民法典_20200528.pdf",
+        "article_anchor": "第一百八十一条"
+      }
+    ],
+    "answer_checks": {
+      "must_include_any": [
+        ["不承担民事责任", "不负民事责任"],
+        ["第一百八十一条", "民法典第一百八十一条"]
+      ],
+      "must_exclude_all": [
+        "应当承担民事责任"
+      ]
+    }
+  },
+  {
+    "id": "contract_probation_limit",
+    "question": "劳动合同法里试用期最长可以约定多久？",
+    "expected_scope": "legal",
+    "expected_references": [
+      {
+        "source_name": "中华人民共和国劳动合同法_20121228.pdf",
+        "article_anchor": "第十九条"
+      }
+    ],
+    "answer_checks": {
+      "must_include_any": [
+        ["六个月", "6个月"],
+        ["第十九条", "劳动合同法第十九条"]
+      ],
+      "must_exclude_all": [
+        "最长一年",
+        "最多一年",
+        "试用期最长一年",
+        "试用期可约定一年"
+      ]
+    }
+  },
+  {
+    "id": "contract_probation_resign",
+    "question": "劳动者在试用期想离职，需要提前几天通知用人单位？",
+    "expected_scope": "legal",
+    "expected_references": [
+      {
+        "source_name": "中华人民共和国劳动合同法_20121228.pdf",
+        "article_anchor": "第三十七条"
+      }
+    ],
+    "answer_checks": {
+      "must_include_any": [
+        ["三日", "3日"],
+        ["第三十七条", "劳动合同法第三十七条"]
+      ],
+      "must_exclude_all": [
+        "三十日",
+        "30日"
+      ]
+    }
+  },
+  {
+    "id": "traffic_admin_duty",
+    "question": "我国道路交通安全管理工作由哪个部门负责？",
+    "expected_scope": "legal",
+    "expected_references": [
+      {
+        "source_name": "中华人民共和国道路交通安全法_20210429.pdf",
+        "article_anchor": "第五条"
+      }
+    ],
+    "answer_checks": {
+      "must_include_any": [
+        ["公安机关交通管理部门"],
+        ["第五条", "道路交通安全法第五条"]
+      ],
+      "must_exclude_all": [
+        "人民法院负责"
+      ]
+    }
+  }
+]

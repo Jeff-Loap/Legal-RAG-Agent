@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,17 @@ RERANKER_REPO_CANDIDATES = (
     "BAAI/bge-reranker-base",
     "BAAI/bge-reranker-v2-m3",
     "maidalun1020/bce-reranker-base_v1",
+)
+
+LLM_PLACEHOLDER_TOKENS = (
+    "你的api密钥",
+    "your_api_key",
+    "your-api-key",
+    "your api key",
+    "sk-xxxx",
+    "sk-your",
+    "please_fill",
+    "请填写",
 )
 
 
@@ -114,9 +126,34 @@ class LLMSettings:
     retrieval_mode: str = "llm_retrieval"
     answer_profile: str = "quality"
 
+    def __post_init__(self) -> None:
+        normalized_profile = "quality"
+        if self.answer_profile != normalized_profile:
+            object.__setattr__(self, "answer_profile", normalized_profile)
+
     @property
     def enabled(self) -> bool:
-        return bool(self.base_url and self.api_key and self.model)
+        return self.disabled_reason == ""
+
+    @property
+    def disabled_reason(self) -> str:
+        base_url = self.base_url.strip()
+        api_key = self.api_key.strip()
+        model = self.model.strip()
+        if not base_url:
+            return "Base URL 为空。"
+        if not api_key:
+            return "API Key 为空。"
+        if not model:
+            return "Model 为空。"
+        normalized_key = api_key.lower()
+        if any(token in normalized_key for token in LLM_PLACEHOLDER_TOKENS):
+            return "API Key 仍是占位值，请填写真实密钥。"
+        if re.search(r"[\u4e00-\u9fff]", api_key):
+            return "API Key 包含中文字符，通常说明仍是占位值或配置错误。"
+        if not re.match(r"^https?://", base_url, re.I):
+            return "Base URL 必须以 http:// 或 https:// 开头。"
+        return ""
 
 
 def get_default_config() -> AppConfig:

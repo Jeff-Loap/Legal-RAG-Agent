@@ -338,7 +338,8 @@ class LegalRAGAgent:
         scope_reason: str = "",
     ) -> dict:
         if not llm_settings.enabled:
-            message = "当前选择的是“大模型检索”模式，但还没有配置可用的 LLM。请先填写 Base URL、API Key 和 Model。"
+            reason = llm_settings.disabled_reason or "请先填写 Base URL、API Key 和 Model。"
+            message = f"当前选择的是“大模型检索”模式，但没有可用的 LLM 配置：{reason}"
             return {
                 "answer": message,
                 "citations": [],
@@ -486,11 +487,11 @@ class LegalRAGAgent:
         return {
             "answer": (
                 "当前问题已识别为通用对话，已跳过法律检索。"
-                "\n\n当前未配置可用的大模型，因此无法继续进行普通对话回答。"
+                f"\n\n当前未配置可用的大模型，因此无法继续进行普通对话回答：{llm_settings.disabled_reason or '缺少必要配置。'}"
             ),
             "citations": [],
             "llm_used": False,
-            "llm_error": "",
+            "llm_error": llm_settings.disabled_reason or "",
             "recent_conversation": recent_conversation,
             "memory_hits": memory_hits,
             "effective_question": effective_question,
@@ -668,7 +669,7 @@ class LegalRAGAgent:
         else:
             answer = "".join(answer_parts).strip()
 
-        if llm_settings.enabled and llm_settings.answer_profile != "fast" and answer:
+        if llm_settings.enabled and answer:
             try:
                 answer = self._self_check_answer(
                     question=question,
@@ -794,7 +795,7 @@ class LegalRAGAgent:
         else:
             answer = "".join(answer_parts).strip()
 
-        if llm_settings.enabled and llm_settings.answer_profile != "fast" and answer:
+        if llm_settings.enabled and answer:
             try:
                 answer = self._self_check_answer(
                     question=question,
@@ -841,7 +842,7 @@ class LegalRAGAgent:
         memory_hits: list[dict],
         llm_settings: LLMSettings,
     ) -> dict[str, str]:
-        if llm_settings.enabled and llm_settings.answer_profile == "quality":
+        if llm_settings.enabled:
             memory_context = self._format_memory_context(memory_hits)
             prompt = ChatPromptTemplate.from_messages(
                 [
@@ -980,7 +981,9 @@ class LegalRAGAgent:
 
         legal_pattern = re.compile(
             r"(法律|法条|法规|条例|规定|刑法|民法|合同|劳动|仲裁|诉讼|起诉|判决|赔偿|侵权|违法|犯罪|"
-            r"正当防卫|防卫过当|责任|处罚|罚款|合规|个人信息|隐私|税|增值税|安全生产|工伤|离职|社保)"
+            r"正当防卫|防卫过当|责任|处罚|罚款|合规|个人信息|隐私|税|增值税|安全生产|工伤|离职|社保|"
+            r"试用期|解除劳动合同|用人单位|通知用人单位|道路交通|交通安全|交通管理|公安机关|"
+            r"公安机关交通管理部门|驾驶证|机动车)"
         )
         if legal_pattern.search(text):
             return "legal"
@@ -998,6 +1001,9 @@ class LegalRAGAgent:
 
     @staticmethod
     def _create_llm_client(llm_settings: LLMSettings) -> OpenAI:
+        if not llm_settings.enabled:
+            reason = llm_settings.disabled_reason or "LLM 配置无效。"
+            raise ValueError(reason)
         return OpenAI(
             base_url=llm_settings.base_url,
             api_key=llm_settings.api_key,
@@ -1023,11 +1029,6 @@ class LegalRAGAgent:
             temperature=llm_settings.temperature,
             max_tokens=llm_settings.max_tokens,
         ).strip()
-        if llm_settings.answer_profile == "fast":
-            return self._ensure_answer_contains_law_content(
-                answer=answer,
-                chunks=chunks,
-            )
         checked_answer = self._self_check_answer(
             question=question,
             answer=answer,
@@ -1144,7 +1145,7 @@ class LegalRAGAgent:
         issues: list[str] = []
         queries: list[str] = []
 
-        if llm_settings.enabled and llm_settings.answer_profile == "quality":
+        if llm_settings.enabled:
             rewritten = (
                 self._rewrite_question_for_legal_retrieval(
                     question=question,
@@ -1405,12 +1406,6 @@ class LegalRAGAgent:
                 )
                 if filtered_chunks:
                     return filtered_chunks[:target_top_k]
-                if (
-                    retrieval_mode == "llm_retrieval"
-                    and llm_settings.answer_profile == "fast"
-                    and candidate_chunks
-                ):
-                    return candidate_chunks[:target_top_k]
         return []
 
     @staticmethod
@@ -1450,7 +1445,7 @@ class LegalRAGAgent:
         if not chunks:
             return []
 
-        if llm_settings.enabled and llm_settings.answer_profile == "quality":
+        if llm_settings.enabled:
             candidate_pool = chunks[:10]
             selected_indexes = self._llm_select_relevant_chunk_indexes(
                 question=question,
@@ -1534,7 +1529,7 @@ class LegalRAGAgent:
                 continue
             if len(text) < 3 and text not in {"侮辱", "诽谤", "强奸", "防卫", "换脸"}:
                 continue
-            if re.search(r"(罪|权|法|责|义务|侵权|侮辱|诽谤|强奸|防卫|平台|审核|网络|通知|删除|处罚)", text):
+            if re.search(r"(罪|权|法|责|义务|侵权|侮辱|诽谤|强奸|防卫|平台|审核|网络|通知|删除|处罚|劳动|合同|试用|离职|用人|工资|工伤|社保|仲裁|道路|交通|公安|机关|驾驶|车辆|安全)", text):
                 focus_terms.add(text)
         if not focus_terms:
             focus_terms = raw_terms
@@ -1767,7 +1762,7 @@ class LegalRAGAgent:
             return []
 
         selected_indexes: list[int] | None = None
-        if llm_settings.enabled and llm_settings.answer_profile == "quality":
+        if llm_settings.enabled:
             selected_indexes = self._validate_citation_indexes(
                 question=question,
                 answer=answer,
@@ -1779,8 +1774,6 @@ class LegalRAGAgent:
             selected_indexes = preferred_indexes
 
         if selected_indexes is None:
-            if llm_settings.answer_profile == "fast":
-                return []
             selected_indexes = list(range(1, min(len(chunks), 3) + 1))
 
         selected_chunks = [
@@ -2041,11 +2034,6 @@ class LegalRAGAgent:
             temperature=llm_settings.temperature,
             max_tokens=llm_settings.max_tokens,
         ).strip()
-        if llm_settings.answer_profile == "fast":
-            return self._ensure_answer_contains_law_content(
-                answer=answer,
-                chunks=chunks,
-            )
         checked_answer = self._self_check_answer(
             question=question,
             answer=answer,
@@ -2746,7 +2734,6 @@ class LegalRAGAgent:
     def _build_thinking_summary(result: dict, llm_settings: LLMSettings) -> str:
         scope = str(result.get("conversation_scope", "legal") or "legal")
         mode = str(result.get("retrieval_mode", llm_settings.retrieval_mode) or llm_settings.retrieval_mode)
-        profile = str(llm_settings.answer_profile or "quality")
         effective_question = str(result.get("effective_question", "") or "").strip()
         memory_hits = result.get("memory_hits") or []
         retrieved_chunks = result.get("retrieved_chunks") or []
@@ -2767,13 +2754,10 @@ class LegalRAGAgent:
         else:
             lines.append("1. 已识别为法律问题，采用混合检索模式。")
 
-        if profile == "fast":
-            lines.append("2. 当前使用快速模式，跳过法律改写、自检和引用一致性校验。")
-        else:
-            lines.append("2. 当前使用精确模式，保留法律改写、法域路由、争点拆解、自检和引用校验。")
+        lines.append("2. 当前使用精确模式，保留法律改写、法域路由、争点拆解、自检和引用校验。")
 
         if effective_question:
-            lines.append(f"3. 检索语句：{effective_question[:180]}")
+            lines.append(f"3. 检索语句：{effective_question}")
         if memory_hits:
             lines.append(f"4. 已召回会话记忆：{len(memory_hits)} 条。")
         if retrieved_chunks:

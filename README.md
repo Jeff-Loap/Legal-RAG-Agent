@@ -1,31 +1,32 @@
 # 法律 RAG 知识库助手
 
-这个项目是一个面向法律问答场景的本地 RAG 知识库助手，提供 Streamlit 图形界面、命令行入口、离线索引构建和带引用的答案生成能力。它主要服务于法律文本检索、法律条文问答、案例/法规辅助定位等任务。
+这是一个面向法律问答场景的本地 RAG 项目，主对话窗口使用 `PySide6` 桌面端，`Streamlit` 只保留为评测面板。项目支持本地知识库检索、带引用的回答、历史会话保存、离线索引重建和回归评测。
 
 ## 这个项目能做什么
 
-- 支持从本地法律文档中构建知识库并进行检索问答
+- 支持从本地法律文档构建知识库并进行检索问答
 - 支持 `llm_retrieval` 和 `hybrid` 两种问答模式
 - 支持带来源引用的回答输出
 - 支持历史会话保存、回看和删除
-- 支持在界面中重建索引
+- 支持通过设置面板重建索引
 - 支持基于本地缓存模型离线运行
+- 支持固定 benchmark 的法律 RAG 回归评测
 
 ## 目录结构
 
-- `app.py`：Streamlit 主界面入口
-- `query_legal_rag.py`：命令行问答入口
+- `legal_rag_desktop.py`：PySide6 主对话窗口
+- `app.py`：Streamlit 评测面板
+- `run_legal_rag_harness.py`：命令行评测入口
+- `legal_rag_harness_gui.py`：评测图形界面
 - `start_rag_app.bat`：Windows 一键启动脚本
 - `legal_agent/`：核心检索、记忆、存储和工作流实现
-- `requirements.txt`：一键安装依赖清单
-- `pdf_data/`：法律 PDF 数据源
-- `raw_data/`：原始文档数据源
+- `requirements.txt`：依赖清单
+- `pdf_data/`：默认法律 PDF 数据源
+- `raw_data/`：默认原始文档数据源
 - `legal_agent_runtime/`：运行时索引与数据库文件
 - `docs/`：项目架构和说明文档
 
 ## 安装步骤
-
-以下流程适合第一次部署这个项目的情况。
 
 ### 1. 准备 Python 环境
 
@@ -54,25 +55,32 @@ pip install -r requirements.txt
 
 ### 3. 配置模型与密钥
 
-这个项目使用 `config.ini` 保存大模型连接信息。公开仓库中已经将密钥占位处理为：
+项目通过 `config.ini` 保存大模型连接信息。仓库中只保留占位符，不要把真实密钥提交到仓库：
 
 ```ini
-api_key = 你的api密钥
+[llm]
+base_url = https://api.example.com/v1
+api_key = YOUR_API_KEY_HERE
+model = your-model-name
+retrieval_mode = llm_retrieval
+answer_profile = quality
+temperature = 0.0
+max_tokens = 8192
 ```
 
-部署时需要把它替换成你自己的真实密钥，或者改用环境变量配置。
-
-`legal_agent/config.py` 也支持从环境变量读取配置，常用字段如下：
+也可以改用环境变量：
 
 - `RAG_LLM_BASE_URL`
 - `RAG_LLM_API_KEY`
 - `RAG_LLM_MODEL`
 - `RAG_RETRIEVAL_MODE`
 - `RAG_ANSWER_PROFILE`
+- `RAG_LLM_TEMPERATURE`
+- `RAG_LLM_MAX_TOKENS`
 
 ### 4. 预下载本地模型
 
-这个项目支持本地缓存模型离线运行。首次部署时可以先执行：
+如果想先把本地缓存模型准备好，可以执行：
 
 ```bash
 python download_local_models.py
@@ -80,26 +88,37 @@ python download_local_models.py
 
 ### 5. 启动应用
 
-#### 方式一：启动图形界面
+#### 主对话窗口
 
-双击 `start_rag_app.bat`，或者在项目目录下执行：
+双击 `start_rag_app.bat`，默认会打开 `PySide6` 主对话窗口。
+
+#### 评测面板
 
 ```bash
-streamlit run app.py
+start_rag_app.bat eval-web
 ```
 
-#### 方式二：命令行问答
+#### 评测 GUI
 
 ```bash
-python query_legal_rag.py
+start_rag_app.bat eval-gui
+```
+
+#### 命令行评测
+
+```bash
+start_rag_app.bat eval-cli
 ```
 
 ## 数据与索引
 
-这个项目默认会从以下目录收集知识源：
+项目默认会从以下目录收集知识源：
 
 - `pdf_data/`
 - `raw_data/`
+- `external_data/`
+- `external_db/`
+- `db_data/`
 
 运行时索引与数据库会写入：
 
@@ -108,12 +127,21 @@ python query_legal_rag.py
 - `legal_agent_runtime/legal_chunks_tfidf.pkl`
 - `legal_agent_runtime/manifest.json`
 
-如果要重新构建知识库，可以在界面侧边栏点击“重建索引”，系统会重新解析本地数据并刷新索引。
+## 如何添加新的知识库
+
+如果要把新的法律知识加入检索，建议按下面流程做：
+
+1. 把新文件放进默认扫描目录之一，例如 `pdf_data/` 或 `raw_data/`。
+2. 如果你的文件不在默认目录里，可以在 `legal_agent/config.py` 的 `candidate_roots` 里补充新的目录。
+3. 确认文件类型是项目支持的格式，例如 `.pdf`、`.docx`、`.jsonl`、`.csv`、`.db`、`.sqlite`、`.sqlite3`。
+4. 启动 `start_rag_app.bat`，在右上角齿轮设置里点击 `重建索引`。
+5. 等待索引重建完成后，新知识库才会进入检索结果。
+
+如果只是把文件拷进目录，但不重建索引，应用不会自动读取到新内容。
 
 ## 主要依赖
 
-这个项目主要依赖以下第三方库：
-
+- `PySide6`
 - `streamlit`
 - `pymupdf`
 - `sentence-transformers`
@@ -129,7 +157,6 @@ python query_legal_rag.py
 - `openai`
 - `langchain-core`
 - `langgraph`
-- `PySide6`
 
 ## 设计特点
 
