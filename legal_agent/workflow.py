@@ -37,6 +37,27 @@ CONTINUE_OUTPUT_PROMPT = (
 )
 
 
+def _new_usage_tracker() -> dict[str, int]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "llm_calls": 0,
+    }
+
+
+def _record_response_usage(usage_tracker: dict[str, int] | None, response: object) -> None:
+    if usage_tracker is None:
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        raise RuntimeError("LLM response missing usage metadata.")
+    usage_tracker["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+    usage_tracker["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+    usage_tracker["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
+    usage_tracker["llm_calls"] += 1
+
+
 class AgentState(TypedDict, total=False):
     question: str
     session_id: str
@@ -73,6 +94,7 @@ class LegalRAGAgent:
         session_id: str | None = None,
         llm_settings: LLMSettings | None = None,
         top_k: int | None = None,
+        usage_tracker: dict[str, int] | None = None,
     ) -> dict:
         llm_settings = llm_settings or load_llm_settings_from_env()
         session_id = session_id or ""
@@ -85,10 +107,11 @@ class LegalRAGAgent:
             recent_conversation=recent_conversation,
             memory_hits=memory_hits,
             llm_settings=llm_settings,
+            usage_tracker=usage_tracker,
         )
 
         if scope_info["scope"] == "general":
-            return self._ask_general_chat(
+            result = self._ask_general_chat(
                 question=question,
                 session_id=session_id,
                 recent_conversation=recent_conversation,
@@ -96,7 +119,12 @@ class LegalRAGAgent:
                 effective_question=effective_question,
                 llm_settings=llm_settings,
                 scope_reason=scope_info["reason"],
+                usage_tracker=usage_tracker,
             )
+            enriched = self._attach_thinking_summary(result, llm_settings)
+            if usage_tracker is not None:
+                enriched["token_usage"] = dict(usage_tracker)
+            return enriched
 
         if llm_settings.retrieval_mode == "llm_retrieval":
             result = self._ask_llm_retrieval(
@@ -107,9 +135,10 @@ class LegalRAGAgent:
                 memory_hits=memory_hits,
                 effective_question=effective_question,
                 scope_reason=scope_info["reason"],
+                usage_tracker=usage_tracker,
             )
         else:
-            graph = self._build_graph(llm_settings)
+            graph = self._build_graph(llm_settings, usage_tracker=usage_tracker)
             result = graph.invoke(
                 {
                     "question": question,
@@ -123,7 +152,10 @@ class LegalRAGAgent:
                     "effective_question": effective_question,
                 }
             )
-        return self._attach_thinking_summary(result, llm_settings)
+        enriched = self._attach_thinking_summary(result, llm_settings)
+        if usage_tracker is not None:
+            enriched["token_usage"] = dict(usage_tracker)
+        return enriched
 
     def stream_ask(
         self,
@@ -194,16 +226,21 @@ class LegalRAGAgent:
             top_k=top_k,
         )
 
-    def _build_graph(self, llm_settings: LLMSettings):
+    def _build_graph(self, llm_settings: LLMSettings, usage_tracker: dict[str, int] | None = None):
         graph = StateGraph(AgentState)
-        graph.add_node("retrieve", lambda state: self._retrieve_node(state, llm_settings))
-        graph.add_node("answer", lambda state: self._answer_node(state, llm_settings))
+        graph.add_node("retrieve", lambda state: self._retrieve_node(state, llm_settings, usage_tracker=usage_tracker))
+        graph.add_node("answer", lambda state: self._answer_node(state, llm_settings, usage_tracker=usage_tracker))
         graph.set_entry_point("retrieve")
         graph.add_edge("retrieve", "answer")
         graph.add_edge("answer", END)
         return graph.compile()
 
-    def _retrieve_node(self, state: AgentState, llm_settings: LLMSettings) -> AgentState:
+    def _retrieve_node(
+        self,
+        state: AgentState,
+        llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
+    ) -> AgentState:
         recent_conversation = state.get("recent_conversation", "")
         memory_hits = state.get("memory_hits", [])
         effective_question = state.get("effective_question", state["question"])
@@ -218,6 +255,7 @@ class LegalRAGAgent:
             recent_conversation=recent_conversation,
             memory_hits=memory_hits,
             llm_settings=llm_settings,
+            usage_tracker=usage_tracker,
         )
         chunks = self._retrieve_relevant_chunks(
             question=state["question"],
@@ -257,7 +295,12 @@ class LegalRAGAgent:
             for chunk in chunks
         ]
 
-    def _answer_node(self, state: AgentState, llm_settings: LLMSettings) -> AgentState:
+    def _answer_node(
+        self,
+        state: AgentState,
+        llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
+    ) -> AgentState:
         chunks = state.get("retrieved_chunks", [])
         memory_hits = state.get("memory_hits", [])
         recent_conversation = state.get("recent_conversation", "无")
@@ -269,6 +312,7 @@ class LegalRAGAgent:
                     memory_hits=memory_hits,
                     chunks=chunks,
                     llm_settings=llm_settings,
+                    usage_tracker=usage_tracker,
                 )
                 return {
                     "answer": answer,
@@ -278,6 +322,7 @@ class LegalRAGAgent:
                         chunks=chunks,
                         llm_settings=llm_settings,
                         retrieval_mode="hybrid",
+                        usage_tracker=usage_tracker,
                     ),
                     "llm_used": True,
                     "llm_error": "",
@@ -336,6 +381,7 @@ class LegalRAGAgent:
         memory_hits: list[dict] | None = None,
         effective_question: str | None = None,
         scope_reason: str = "",
+        usage_tracker: dict[str, int] | None = None,
     ) -> dict:
         if not llm_settings.enabled:
             reason = llm_settings.disabled_reason or "请先填写 Base URL、API Key 和 Model。"
@@ -362,6 +408,7 @@ class LegalRAGAgent:
             recent_conversation=recent_conversation,
             memory_hits=memory_hits,
             llm_settings=llm_settings,
+            usage_tracker=usage_tracker,
         )
         candidate_chunks = self._retrieve_relevant_chunks(
             question=question,
@@ -395,6 +442,7 @@ class LegalRAGAgent:
                 memory_hits=memory_hits,
                 chunks=candidate_chunks,
                 llm_settings=llm_settings,
+                usage_tracker=usage_tracker,
             )
             citations = self._select_citations_for_answer(
                 question=question,
@@ -403,6 +451,7 @@ class LegalRAGAgent:
                 llm_settings=llm_settings,
                 preferred_indexes=self._extract_cited_candidate_numbers(answer, len(candidate_chunks)),
                 retrieval_mode="llm_retrieval",
+                usage_tracker=usage_tracker,
             )
             return {
                 "answer": answer,
@@ -443,6 +492,7 @@ class LegalRAGAgent:
         effective_question: str,
         llm_settings: LLMSettings,
         scope_reason: str,
+        usage_tracker: dict[str, int] | None = None,
     ) -> dict:
         if llm_settings.enabled:
             try:
@@ -451,6 +501,7 @@ class LegalRAGAgent:
                     recent_conversation=recent_conversation,
                     memory_hits=memory_hits,
                     llm_settings=llm_settings,
+                    usage_tracker=usage_tracker,
                 )
                 return {
                     "answer": answer,
@@ -841,6 +892,7 @@ class LegalRAGAgent:
         recent_conversation: str,
         memory_hits: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> dict[str, str]:
         if llm_settings.enabled:
             memory_context = self._format_memory_context(memory_hits)
@@ -873,6 +925,7 @@ class LegalRAGAgent:
                     },
                     llm_settings=llm_settings,
                     max_tokens=80,
+                    usage_tracker=usage_tracker,
                 )
                 payload = self._parse_json_object(content)
                 scope = str((payload or {}).get("scope", "")).strip().lower()
@@ -896,6 +949,7 @@ class LegalRAGAgent:
         recent_conversation: str,
         memory_hits: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         memory_context = self._format_memory_context(memory_hits)
         prompt = ChatPromptTemplate.from_messages(
@@ -926,6 +980,7 @@ class LegalRAGAgent:
             llm_settings=llm_settings,
             max_tokens=max(240, min(llm_settings.max_tokens, 900)),
             temperature=llm_settings.temperature,
+            usage_tracker=usage_tracker,
         )
         return content.strip()
 
@@ -1017,6 +1072,7 @@ class LegalRAGAgent:
         memory_hits: list[dict],
         chunks: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         answer = self._invoke_serialized_messages(
             messages=self._build_llm_retrieval_messages(
@@ -1028,6 +1084,7 @@ class LegalRAGAgent:
             llm_settings=llm_settings,
             temperature=llm_settings.temperature,
             max_tokens=llm_settings.max_tokens,
+            usage_tracker=usage_tracker,
         ).strip()
         checked_answer = self._self_check_answer(
             question=question,
@@ -1037,6 +1094,7 @@ class LegalRAGAgent:
             chunks=chunks,
             llm_settings=llm_settings,
             retrieval_mode="llm_retrieval",
+            usage_tracker=usage_tracker,
         )
         return self._ensure_answer_contains_law_content(
             answer=checked_answer,
@@ -1139,6 +1197,7 @@ class LegalRAGAgent:
         recent_conversation: str,
         memory_hits: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> dict:
         rewritten = effective_question
         domains: list[str] = []
@@ -1153,6 +1212,7 @@ class LegalRAGAgent:
                     recent_conversation=recent_conversation,
                     memory_hits=memory_hits,
                     llm_settings=llm_settings,
+                    usage_tracker=usage_tracker,
                 )
                 or effective_question
             )
@@ -1162,6 +1222,7 @@ class LegalRAGAgent:
                 recent_conversation=recent_conversation,
                 memory_hits=memory_hits,
                 llm_settings=llm_settings,
+                usage_tracker=usage_tracker,
             )
             issues, queries = self._decompose_legal_issues(
                 question=question,
@@ -1170,6 +1231,7 @@ class LegalRAGAgent:
                 memory_hits=memory_hits,
                 domains=domains,
                 llm_settings=llm_settings,
+                usage_tracker=usage_tracker,
             )
 
         query_variants: list[str] = []
@@ -1192,6 +1254,7 @@ class LegalRAGAgent:
         recent_conversation: str,
         memory_hits: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str | None:
         memory_context = self._format_memory_context(memory_hits)
         prompt = ChatPromptTemplate.from_messages(
@@ -1243,6 +1306,7 @@ class LegalRAGAgent:
             )
         except Exception:
             return None
+        _record_response_usage(usage_tracker, response)
 
         rewritten = " ".join((response.choices[0].message.content or "").split())
         if not rewritten:
@@ -1260,6 +1324,7 @@ class LegalRAGAgent:
         recent_conversation: str,
         memory_hits: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> list[str]:
         memory_context = self._format_memory_context(memory_hits)
         prompt = ChatPromptTemplate.from_messages(
@@ -1292,6 +1357,7 @@ class LegalRAGAgent:
                 },
                 llm_settings=llm_settings,
                 max_tokens=120,
+                usage_tracker=usage_tracker,
             )
         except Exception:
             return []
@@ -1314,6 +1380,7 @@ class LegalRAGAgent:
         memory_hits: list[dict],
         domains: list[str],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> tuple[list[str], list[str]]:
         memory_context = self._format_memory_context(memory_hits)
         prompt = ChatPromptTemplate.from_messages(
@@ -1348,6 +1415,7 @@ class LegalRAGAgent:
                 },
                 llm_settings=llm_settings,
                 max_tokens=220,
+                usage_tracker=usage_tracker,
             )
         except Exception:
             return [], []
@@ -1593,6 +1661,7 @@ class LegalRAGAgent:
         memory_hits: list[dict],
         chunks: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> list[int] | None:
         memory_context = self._format_memory_context(memory_hits)
         candidate_context = "\n\n".join(
@@ -1651,6 +1720,7 @@ class LegalRAGAgent:
             )
         except Exception:
             return None
+        _record_response_usage(usage_tracker, response)
 
         content = response.choices[0].message.content or ""
         return self._parse_relevant_index_response(content, len(chunks))
@@ -1697,6 +1767,7 @@ class LegalRAGAgent:
         chunks: list[dict],
         llm_settings: LLMSettings,
         retrieval_mode: str,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         if not llm_settings.enabled or not answer.strip():
             return answer
@@ -1743,6 +1814,7 @@ class LegalRAGAgent:
                 },
                 llm_settings=llm_settings,
                 max_tokens=max(300, min(llm_settings.max_tokens, 900)),
+                usage_tracker=usage_tracker,
             )
         except Exception:
             return answer
@@ -1757,6 +1829,7 @@ class LegalRAGAgent:
         llm_settings: LLMSettings,
         preferred_indexes: list[int] | None = None,
         retrieval_mode: str = "hybrid",
+        usage_tracker: dict[str, int] | None = None,
     ) -> list[dict]:
         if not chunks:
             return []
@@ -1768,6 +1841,7 @@ class LegalRAGAgent:
                 answer=answer,
                 chunks=chunks,
                 llm_settings=llm_settings,
+                usage_tracker=usage_tracker,
             )
 
         if selected_indexes is None and preferred_indexes:
@@ -1789,6 +1863,7 @@ class LegalRAGAgent:
         answer: str,
         chunks: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> list[int] | None:
         candidate_context = "\n\n".join(
             [
@@ -1824,6 +1899,7 @@ class LegalRAGAgent:
                 },
                 llm_settings=llm_settings,
                 max_tokens=160,
+                usage_tracker=usage_tracker,
             )
         except Exception:
             return None
@@ -1838,12 +1914,14 @@ class LegalRAGAgent:
         payload: dict,
         llm_settings: LLMSettings,
         max_tokens: int,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         return self._invoke_text_prompt(
             prompt=prompt,
             payload=payload,
             llm_settings=llm_settings,
             max_tokens=max_tokens,
+            usage_tracker=usage_tracker,
         )
 
     def _invoke_text_prompt(
@@ -1853,6 +1931,7 @@ class LegalRAGAgent:
         llm_settings: LLMSettings,
         max_tokens: int,
         temperature: float = 0,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         messages = prompt.invoke(payload).messages
         return self._invoke_serialized_messages(
@@ -1860,6 +1939,7 @@ class LegalRAGAgent:
             llm_settings=llm_settings,
             temperature=temperature,
             max_tokens=max_tokens,
+            usage_tracker=usage_tracker,
         )
 
     @staticmethod
@@ -1893,6 +1973,7 @@ class LegalRAGAgent:
         llm_settings: LLMSettings,
         temperature: float,
         max_tokens: int,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         client = self._create_llm_client(llm_settings)
         base_messages = [dict(message) for message in messages]
@@ -1907,6 +1988,7 @@ class LegalRAGAgent:
                 stream=False,
                 messages=current_messages,
             )
+            _record_response_usage(usage_tracker, response)
             if not response.choices:
                 raise RuntimeError("LLM returned no choices.")
             choice = response.choices[0]
@@ -2022,6 +2104,7 @@ class LegalRAGAgent:
         memory_hits: list[dict],
         chunks: list[dict],
         llm_settings: LLMSettings,
+        usage_tracker: dict[str, int] | None = None,
     ) -> str:
         answer = self._invoke_serialized_messages(
             messages=self._build_chat_messages(
@@ -2033,6 +2116,7 @@ class LegalRAGAgent:
             llm_settings=llm_settings,
             temperature=llm_settings.temperature,
             max_tokens=llm_settings.max_tokens,
+            usage_tracker=usage_tracker,
         ).strip()
         checked_answer = self._self_check_answer(
             question=question,
@@ -2042,6 +2126,7 @@ class LegalRAGAgent:
             chunks=chunks,
             llm_settings=llm_settings,
             retrieval_mode="hybrid",
+            usage_tracker=usage_tracker,
         )
         return self._ensure_answer_contains_law_content(
             answer=checked_answer,

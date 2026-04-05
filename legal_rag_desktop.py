@@ -4,15 +4,17 @@ from __future__ import annotations
 import configparser
 from html import escape
 from pathlib import Path
+from urllib.parse import quote, unquote
 import sys
 from uuid import uuid4
 
 from legal_agent import LegalRAGAgent, LegalRAGStore, get_default_config
 from legal_agent.config import LLMSettings
+from legal_agent.live_eval import evaluate_live_turn
 
 import markdown
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -144,6 +146,9 @@ body { background: transparent; color: #17324d; font-family: "Microsoft YaHei UI
 .panel-title { font-size: 14px; font-weight: 700; color: #174977; margin-bottom: 6px; }
 .panel-subtitle { color: #6b88a3; font-size: 12px; margin-bottom: 12px; }
 .source-path { color: #5d7891; font-size: 12px; word-break: break-all; }
+.source-action { margin: 8px 0 10px 0; }
+.source-action a { display: inline-block; color: #0f5da8; text-decoration: none; font-weight: 700; padding: 6px 12px; border-radius: 999px; background: #e5f1ff; border: 1px solid #b8d7fb; }
+.source-action a:hover { background: #d8ecff; }
 .snippet { margin-top: 8px; line-height: 1.68; }
 .panel-content code { background: #eaf3ff; color: #184f86; padding: 2px 6px; border-radius: 8px; }
 .panel-content pre { background: #0f2136; color: #edf6ff; padding: 14px 16px; border-radius: 16px; overflow-x: auto; }
@@ -216,6 +221,10 @@ def build_panel_html(title: str, subtitle: str, inner_html: str) -> str:
     )
 
 
+def build_citation_open_url(source_path: str) -> str:
+    return f"rag-citation://open?path={quote(source_path, safe='')}"
+
+
 class ChatWorker(QObject):
     thinking_token = Signal(str)
     answer_token = Signal(str)
@@ -261,6 +270,63 @@ class RebuildWorker(QObject):
             stats = store.rebuild()
         except Exception as exc:
             self.failed.emit(" ".join(str(exc).split()) or exc.__class__.__name__)
+
+
+class LiveEvalWorker(QObject):
+    completed = Signal(object)
+    failed = Signal(int, str)
+
+    def __init__(self, store: LegalRAGStore, history_id: int) -> None:
+        super().__init__()
+        self.store = store
+        self.history_id = history_id
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            entry = self.store.get_history_entry(self.history_id)
+            if entry is None:
+                raise ValueError(f"历史记录不存在：{self.history_id}")
+            payload = {
+                "question": entry.question,
+                "answer": entry.answer,
+                "thinking": entry.thinking,
+                "retrieved_chunks": entry.retrieved_chunks,
+                "citations": entry.citations,
+                "conversation_scope": entry.conversation_scope,
+                "scope_reason": entry.scope_reason,
+                "retrieval_mode": entry.retrieval_mode,
+                "effective_question": entry.effective_question,
+                "llm_error": entry.llm_error,
+            }
+            evaluation = evaluate_live_turn(payload)
+            self.store.save_live_evaluation(self.history_id, evaluation)
+            self.completed.emit(
+                {
+                    "history_id": self.history_id,
+                    "evaluation": evaluation,
+                }
+            )
+        except Exception as exc:
+            message = " ".join(str(exc).split()) or exc.__class__.__name__
+            try:
+                self.store.save_live_evaluation(
+                    self.history_id,
+                    {
+                        "status": "error",
+                        "overall_score": 0.0,
+                        "question_answer_overlap_score": 0.0,
+                        "retrieval_support_score": 0.0,
+                        "citation_link_score": 0.0,
+                        "answer_length_score": 0.0,
+                        "issue_count": 1,
+                        "issues": [message],
+                        "summary": f"实时评测失败：{message}",
+                    },
+                )
+            except Exception:
+                pass
+            self.failed.emit(self.history_id, message)
             return
         self.completed.emit(stats)
 
@@ -394,6 +460,7 @@ class MainWindow(QMainWindow):
         self.agent = LegalRAGAgent(store=self.store, config=self.config)
         self.llm_settings = load_llm_settings_from_ini()
         self.current_session_id = uuid4().hex
+        self.current_history_id = 0
         self.current_thinking_buffer = ""
         self.current_answer_buffer = ""
         self.current_citations: list[dict] = []
@@ -404,6 +471,8 @@ class MainWindow(QMainWindow):
         self.chat_worker: ChatWorker | None = None
         self.rebuild_thread: QThread | None = None
         self.rebuild_worker: RebuildWorker | None = None
+        self.live_eval_threads: dict[int, QThread] = {}
+        self.live_eval_workers: dict[int, LiveEvalWorker] = {}
         self.running_label_base = "待命"
         self.running_step = 0
 
@@ -420,6 +489,7 @@ class MainWindow(QMainWindow):
         self.render_thinking_panel("")
         self.render_citations_panel([])
         self.render_session_info({})
+        QTimer.singleShot(1200, self.backfill_pending_live_evaluations)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -509,6 +579,10 @@ class MainWindow(QMainWindow):
         self.chat_output = QTextBrowser()
         self.chat_output.setOpenExternalLinks(True)
         self.chat_output.setReadOnly(True)
+        self.chat_output_autoscroll_enabled = False
+        self.chat_output_autoscroll_paused = False
+        self.chat_output_scroll_syncing = False
+        self.chat_output.verticalScrollBar().valueChanged.connect(self.on_chat_output_scroll_changed)
         chat_layout.addWidget(self.chat_output, 1)
         center_layout.addWidget(chat_card, 1)
 
@@ -553,7 +627,9 @@ class MainWindow(QMainWindow):
         self.thinking_output = QTextBrowser()
         self.thinking_output.setOpenExternalLinks(True)
         self.citations_output = QTextBrowser()
-        self.citations_output.setOpenExternalLinks(True)
+        self.citations_output.setOpenExternalLinks(False)
+        self.citations_output.setOpenLinks(False)
+        self.citations_output.anchorClicked.connect(self.open_citation_link)
         self.session_info_output = QTextBrowser()
         self.session_info_output.setOpenExternalLinks(True)
         self.detail_tabs.addTab(self.thinking_output, "思考过程")
@@ -588,6 +664,37 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("subCard")
         return frame
+
+    def set_chat_autoscroll(self, enabled: bool) -> None:
+        self.chat_output_autoscroll_enabled = enabled
+        self.chat_output_autoscroll_paused = False
+
+    def restore_chat_scroll_position(self, value: int) -> None:
+        bar = self.chat_output.verticalScrollBar()
+        target = max(0, min(value, bar.maximum()))
+        self.chat_output_scroll_syncing = True
+        try:
+            bar.setValue(target)
+        finally:
+            self.chat_output_scroll_syncing = False
+
+    def scroll_chat_output_to_bottom(self) -> None:
+        bar = self.chat_output.verticalScrollBar()
+        self.chat_output_scroll_syncing = True
+        try:
+            bar.setValue(bar.maximum())
+        finally:
+            self.chat_output_scroll_syncing = False
+
+    @Slot(int)
+    def on_chat_output_scroll_changed(self, value: int) -> None:
+        if self.chat_output_scroll_syncing or not self.chat_output_autoscroll_enabled:
+            return
+        bar = self.chat_output.verticalScrollBar()
+        if value >= max(0, bar.maximum() - 2):
+            self.chat_output_autoscroll_paused = False
+        else:
+            self.chat_output_autoscroll_paused = True
 
     def apply_global_style(self) -> None:
         self.setStyleSheet(APP_STYLE)
@@ -668,6 +775,7 @@ class MainWindow(QMainWindow):
             self.history_list.addItem(item)
 
     def render_chat_history(self) -> None:
+        previous_scroll_value = self.chat_output.verticalScrollBar().value()
         blocks: list[str] = []
         for message in self.chat_messages:
             role = str(message.get("role", "assistant"))
@@ -699,8 +807,16 @@ class MainWindow(QMainWindow):
             )
 
         html = f"<html><head>{CHAT_HTML_STYLE}</head><body>{''.join(blocks)}</body></html>"
-        self.chat_output.setHtml(html)
-        self.chat_output.moveCursor(QTextCursor.End)
+        self.chat_output_scroll_syncing = True
+        try:
+            self.chat_output.setHtml(html)
+        finally:
+            self.chat_output_scroll_syncing = False
+
+        if self.chat_output_autoscroll_enabled and not self.chat_output_autoscroll_paused:
+            self.scroll_chat_output_to_bottom()
+        else:
+            self.restore_chat_scroll_position(previous_scroll_value)
 
     def render_thinking_panel(self, thinking: str) -> None:
         subtitle = "完整展示当前轮的思考摘要、检索语句和阶段信息。"
@@ -716,12 +832,27 @@ class MainWindow(QMainWindow):
         for index, citation in enumerate(citations, start=1):
             label = escape(str(citation.get("label", f"引用 {index}")))
             source_path = str(citation.get("source_path", "") or "").strip()
-            escaped_path = escape(source_path)
-            file_href = f"file:///{source_path.replace(chr(92), '/')}" if source_path else ""
-            if file_href:
-                path_html = f"<a class='source-path' href='{escape(file_href)}'>{escaped_path}</a>"
+            source_name = escape(str(citation.get("source_name", "") or "未知来源"))
+            title = escape(str(citation.get("title", "") or ""))
+            page_start = citation.get("page_start")
+            page_end = citation.get("page_end")
+            page_text = ""
+            if page_start and page_end:
+                page_text = f"第 {page_start} 页"
+                if page_start != page_end:
+                    page_text = f"第 {page_start}-{page_end} 页"
+            open_href = build_citation_open_url(source_path) if source_path else ""
+            if open_href:
+                path_html = (
+                    f"<div class='source-path'>{source_name}"
+                    + (f" · {title}" if title else "")
+                    + (f" · {escape(page_text)}" if page_text else "")
+                    + "</div>"
+                    f"<div class='source-action'><a href='{escape(open_href)}'>打开原文</a></div>"
+                    f"<div class='source-path'>{escape(source_path)}</div>"
+                )
             else:
-                path_html = f"<div class='source-path'>{escaped_path or '未记录路径'}</div>"
+                path_html = f"<div class='source-path'>{source_name}</div><div class='source-path'>{escape(source_path) or '未记录路径'}</div>"
             snippet_html = markdown_to_html(str(citation.get("snippet", "") or ""))
             cards.append(
                 "<div class='panel-card'>"
@@ -734,6 +865,38 @@ class MainWindow(QMainWindow):
 
         html = f"<html><head>{PANEL_HTML_STYLE}</head><body>{''.join(cards)}</body></html>"
         self.citations_output.setHtml(html)
+
+    @Slot(QUrl)
+    def open_citation_link(self, url: QUrl) -> None:
+        if not url.isValid():
+            QMessageBox.warning(self, "打开失败", "引用链接无效。")
+            return
+
+        if url.scheme() == "rag-citation":
+            raw_path = url.query().split("path=", 1)[-1] if "path=" in url.query() else ""
+            if not raw_path:
+                QMessageBox.warning(self, "打开失败", "引用链接缺少文件路径。")
+                return
+            source_path = unquote(raw_path)
+            local_file = Path(str(source_path))
+            if not local_file.exists():
+                QMessageBox.warning(self, "打开失败", f"文件不存在：{local_file}")
+                return
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(local_file))):
+                QMessageBox.warning(self, "打开失败", f"无法打开文件：{local_file}")
+            return
+
+        if url.isLocalFile():
+            local_file = Path(url.toLocalFile())
+            if not local_file.exists():
+                QMessageBox.warning(self, "打开失败", f"文件不存在：{local_file}")
+                return
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(local_file))):
+                QMessageBox.warning(self, "打开失败", f"无法打开文件：{local_file}")
+            return
+
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "打开失败", f"无法打开链接：{url.toString()}")
 
     def render_session_info(self, payload: dict[str, object]) -> None:
         if not payload:
@@ -782,7 +945,9 @@ class MainWindow(QMainWindow):
         if self.chat_thread is not None:
             QMessageBox.warning(self, "运行中", "当前仍在生成回答，不能切换会话。")
             return
+        self.set_chat_autoscroll(False)
         self.current_session_id = uuid4().hex
+        self.current_history_id = 0
         self.update_session_label()
         self.chat_messages = []
         self.current_thinking_buffer = ""
@@ -859,6 +1024,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "配置错误", llm_settings.disabled_reason)
             return
 
+        self.set_chat_autoscroll(True)
         self.current_thinking_buffer = ""
         self.current_answer_buffer = ""
         self.current_citations = []
@@ -917,6 +1083,7 @@ class MainWindow(QMainWindow):
             self.chat_messages[-1]["pending"] = False
             self.chat_messages[-1]["state"] = f"{mode_name} · 已完成"
             self.render_chat_history()
+        self.set_chat_autoscroll(False)
 
         info_payload = {
             "session_id": self.current_session_id,
@@ -932,6 +1099,7 @@ class MainWindow(QMainWindow):
         scope_reason = str(result.get("scope_reason", "") or "").strip()
         if scope_reason:
             info_payload["scope_reason"] = scope_reason
+        info_payload["live_eval"] = "排队中"
 
         self.render_thinking_panel(str(result.get("thinking", "") or self.current_thinking_buffer))
         self.render_citations_panel(self.current_citations)
@@ -945,11 +1113,19 @@ class MainWindow(QMainWindow):
             citations=self.current_citations,
             llm_used=bool(result.get("llm_used", False)),
             llm_error=llm_error,
+            retrieved_chunks=list(result.get("retrieved_chunks", []) or []),
+            conversation_scope=str(result.get("conversation_scope", "") or ""),
+            scope_reason=str(result.get("scope_reason", "") or ""),
+            retrieval_mode=mode_name,
+            effective_question=str(result.get("effective_question", "") or ""),
         )
         saved_entry = self.store.get_history_entry(saved_id)
         if saved_entry is None:
             self.on_chat_failed(f"历史记录保存后读取失败：{saved_id}")
             return
+
+        self.current_history_id = saved_id
+        self.start_live_evaluation(saved_id)
 
         self.refresh_history_list()
         self.set_busy_state(False, "回答完成")
@@ -959,6 +1135,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_chat_failed(self, message: str) -> None:
+        self.set_chat_autoscroll(False)
         if self.chat_messages and self.chat_messages[-1].get("role") == "assistant":
             current = str(self.chat_messages[-1].get("content", "") or "")
             error_markdown = f"{current}\n\n> [错误] {message}".strip()
@@ -972,6 +1149,94 @@ class MainWindow(QMainWindow):
             self.chat_thread.quit()
         self.pending_question = ""
         QMessageBox.warning(self, "失败", message)
+
+    def start_live_evaluation(self, history_id: int) -> None:
+        if history_id in self.live_eval_threads:
+            return
+        try:
+            entry = self.store.get_history_entry(history_id)
+            if entry is None:
+                return
+            self.store.save_live_evaluation(
+                history_id,
+                {
+                    "status": "processing",
+                    "overall_score": 0.0,
+                    "question_answer_overlap_score": 0.0,
+                    "retrieval_support_score": 0.0,
+                    "citation_link_score": 0.0,
+                    "answer_length_score": 0.0,
+                    "issue_count": 0,
+                    "issues": [],
+                    "summary": "实时评测处理中...",
+                },
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "实时评测启动失败", " ".join(str(exc).split()) or exc.__class__.__name__)
+            return
+        thread = QThread(self)
+        worker = LiveEvalWorker(self.store, history_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.on_live_eval_completed)
+        worker.failed.connect(self.on_live_eval_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(lambda hid=history_id: self.cleanup_live_eval_thread(hid))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.live_eval_threads[history_id] = thread
+        self.live_eval_workers[history_id] = worker
+        thread.start()
+
+    def backfill_pending_live_evaluations(self) -> None:
+        pending_entries = self.store.list_pending_history_entries(limit=50)
+        for entry in pending_entries:
+            self.start_live_evaluation(entry.id)
+        if pending_entries:
+            self.status_label.setText(f"实时评测补评 {len(pending_entries)} 条")
+
+    @Slot(object)
+    def on_live_eval_completed(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        history_id = int(payload.get("history_id", 0) or 0)
+        evaluation = payload.get("evaluation", {}) or {}
+        self.cleanup_live_eval_thread(history_id)
+
+        score = float(evaluation.get("overall_score", 0.0) or 0.0)
+        summary = str(evaluation.get("summary", "") or "")
+        issue_count = int(evaluation.get("issue_count", 0) or 0)
+        if history_id == self.current_history_id:
+            stored_evaluation = self.store.get_live_evaluation_by_history_id(history_id)
+            if stored_evaluation is None:
+                stored_evaluation = {}
+            self.render_session_info(
+                {
+                    "session_id": stored_evaluation.get("session_id", self.current_session_id),
+                    "turn_id": stored_evaluation.get("turn_id", history_id),
+                    "retrieval_mode": stored_evaluation.get("retrieval_mode", self.llm_settings.retrieval_mode),
+                    "conversation_scope": stored_evaluation.get("conversation_scope", ""),
+                    "live_eval_score": f"{score * 100:.1f}%",
+                    "live_eval_summary": stored_evaluation.get("summary", summary),
+                    "live_eval_issues": stored_evaluation.get("issue_count", issue_count),
+                }
+            )
+            self.status_chip.setText(f"实时评测 {score * 100:.1f}%")
+            self.status_label.setText(f"实时评测 {score * 100:.1f}%")
+        elif summary:
+            self.status_label.setText(f"实时评测 {score * 100:.1f}%")
+
+    @Slot(int, str)
+    def on_live_eval_failed(self, history_id: int, message: str) -> None:
+        if history_id == self.current_history_id:
+            self.status_label.setText("实时评测失败")
+            self.status_chip.setText("实时评测失败")
+            self.render_session_info({"session_id": self.current_session_id, "live_eval_error": message})
+
+    def cleanup_live_eval_thread(self, history_id: int) -> None:
+        self.live_eval_threads.pop(history_id, None)
+        self.live_eval_workers.pop(history_id, None)
 
     @Slot()
     def cleanup_chat_thread(self) -> None:
@@ -988,6 +1253,7 @@ class MainWindow(QMainWindow):
         if self.chat_thread is not None:
             QMessageBox.warning(self, "运行中", "当前仍在生成回答，不能加载历史会话。")
             return
+        self.set_chat_autoscroll(False)
         session_id = str(item.data(Qt.UserRole) or "").strip()
         if not session_id:
             QMessageBox.warning(self, "缺少会话", "该历史项缺少 session_id。")
@@ -1006,17 +1272,22 @@ class MainWindow(QMainWindow):
         self.render_chat_history()
 
         latest_entry = entries[-1]
+        self.current_history_id = latest_entry.id
         self.render_thinking_panel(latest_entry.thinking)
         citations = [item for item in latest_entry.citations if isinstance(item, dict)]
         self.render_citations_panel(citations)
-        self.render_session_info(
-            {
-                "session_id": session_id,
-                "history_turns": len(entries),
-                "latest_turn_id": latest_entry.turn_id,
-                "latest_created_at": latest_entry.created_at,
-            }
-        )
+        info_payload = {
+            "session_id": session_id,
+            "history_turns": len(entries),
+            "latest_turn_id": latest_entry.turn_id,
+            "latest_created_at": latest_entry.created_at,
+        }
+        evaluation = self.store.get_live_evaluation_by_history_id(latest_entry.id)
+        if evaluation is not None:
+            info_payload["live_eval_score"] = f"{float(evaluation.get('overall_score', 0.0)) * 100:.1f}%"
+            info_payload["live_eval_summary"] = evaluation.get("summary", "")
+            info_payload["live_eval_issues"] = int(evaluation.get("issue_count", 0) or 0)
+        self.render_session_info(info_payload)
         self.status_chip.setText("已加载历史会话")
         self.status_label.setText("已加载历史会话")
 
