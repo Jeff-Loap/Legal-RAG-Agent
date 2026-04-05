@@ -1,27 +1,22 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import configparser
-import json
-import os
 from pathlib import Path
-import subprocess
-import sys
 
 import streamlit as st
 
 from legal_agent import LegalRAGStore, get_default_config
 from legal_agent.config import LLMSettings
+from legal_agent.live_eval import evaluate_live_turn
+from legal_agent.mode_compare import compare_retrieval_modes
+from legal_agent.workflow import LegalRAGAgent
 
 
-st.set_page_config(page_title="法律 RAG 评测面板", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="法律 RAG 实时评测面板", page_icon="⚖️", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_INI_PATH = APP_DIR / "config.ini"
-HARNESS_SCRIPT_PATH = APP_DIR / "run_legal_rag_harness.py"
-HARNESS_REPORT_PATH = APP_DIR / "eval" / "reports" / "legal_rag_harness_latest.json"
-HARNESS_BENCHMARK_PATH = APP_DIR / "eval" / "legal_qa_benchmark.json"
-HARNESS_MODES = ("hybrid", "llm_retrieval")
+LIVE_POLL_SECONDS = 2
 
 
 @st.cache_resource(show_spinner=False)
@@ -43,18 +38,19 @@ def load_llm_settings_from_ini() -> LLMSettings:
         retrieval_mode=parser.get("llm", "retrieval_mode", fallback="llm_retrieval").strip() or "llm_retrieval",
         answer_profile="quality",
     )
-
-
-def build_harness_env(llm_settings: LLMSettings) -> dict[str, str]:
-    env = dict(os.environ)
-    env["RAG_LLM_BASE_URL"] = llm_settings.base_url
-    env["RAG_LLM_API_KEY"] = llm_settings.api_key
-    env["RAG_LLM_MODEL"] = llm_settings.model
-    env["RAG_LLM_TEMPERATURE"] = str(llm_settings.temperature)
-    env["RAG_LLM_MAX_TOKENS"] = str(llm_settings.max_tokens)
-    env["USE_TORCH"] = "1"
-    env["USE_TF"] = "0"
-    return env
+def history_entry_payload(entry) -> dict[str, object]:
+    return {
+        "question": entry.question,
+        "answer": entry.answer,
+        "thinking": entry.thinking,
+        "retrieved_chunks": entry.retrieved_chunks,
+        "citations": entry.citations,
+        "conversation_scope": entry.conversation_scope,
+        "scope_reason": entry.scope_reason,
+        "retrieval_mode": entry.retrieval_mode,
+        "effective_question": entry.effective_question,
+        "llm_error": entry.llm_error,
+    }
 
 
 def rebuild_knowledge_base() -> str:
@@ -63,231 +59,287 @@ def rebuild_knowledge_base() -> str:
     return f"重建完成：{stats.documents} 个文档，{stats.chunks} 个 chunks。"
 
 
-def run_harness(modes: list[str], llm_settings: LLMSettings) -> dict:
-    if not HARNESS_SCRIPT_PATH.exists():
-        raise FileNotFoundError(f"Harness script not found: {HARNESS_SCRIPT_PATH}")
-    if not HARNESS_BENCHMARK_PATH.exists():
-        raise FileNotFoundError(f"Harness benchmark not found: {HARNESS_BENCHMARK_PATH}")
-
-    command = [
-        sys.executable,
-        str(HARNESS_SCRIPT_PATH),
-        "--benchmark",
-        str(HARNESS_BENCHMARK_PATH),
-        "--modes",
-        *modes,
-        "--output",
-        str(HARNESS_REPORT_PATH),
-        "--details",
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=str(APP_DIR),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=3600,
-        env=build_harness_env(llm_settings),
-    )
+def backfill_pending_live_evaluations(limit: int = 100) -> dict[str, int]:
+    store = get_store()
+    pending_entries = store.list_pending_history_entries(limit=limit)
+    processed = 0
+    for entry in pending_entries:
+        evaluation = evaluate_live_turn(history_entry_payload(entry))
+        store.save_live_evaluation(entry.id, evaluation)
+        processed += 1
     return {
-        "command": command,
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "report_path": str(HARNESS_REPORT_PATH),
+        "processed": processed,
+        "pending": store.count_pending_history_entries(),
     }
 
 
-def load_harness_report() -> dict | None:
-    if not HARNESS_REPORT_PATH.exists():
-        return None
-    return json.loads(HARNESS_REPORT_PATH.read_text(encoding="utf-8"))
+def sync_live_update_token(store: LegalRAGStore) -> str:
+    token = store.get_live_update_token()
+    st.session_state["live_update_token"] = token
+    return token
 
 
-def format_rate(value: float | int | None) -> str:
-    try:
-        return f"{float(value) * 100:.1f}%"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def load_benchmark_text() -> str:
-    if not HARNESS_BENCHMARK_PATH.exists():
-        raise FileNotFoundError(f"Benchmark file not found: {HARNESS_BENCHMARK_PATH}")
-    return HARNESS_BENCHMARK_PATH.read_text(encoding="utf-8")
-
-
-def save_benchmark_text(text: str) -> None:
-    parsed = json.loads(text)
-    if not isinstance(parsed, list):
-        raise ValueError("Benchmark JSON 顶层必须是数组。")
-    HARNESS_BENCHMARK_PATH.write_text(
-        json.dumps(parsed, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def render_sidebar() -> tuple[LLMSettings, bool]:
-    config = get_default_config()
+@st.fragment(run_every=f"{LIVE_POLL_SECONDS}s")
+def render_live_update_watcher(enabled: bool) -> None:
+    if not enabled:
+        return
     store = get_store()
+    latest_token = store.get_live_update_token()
+    last_seen_token = st.session_state.get("live_update_token", "")
+    if not last_seen_token:
+        st.session_state["live_update_token"] = latest_token
+        return
+    if latest_token != last_seen_token:
+        st.session_state["live_update_token"] = latest_token
+        st.rerun()
+
+
+def render_sidebar() -> tuple[bool, LLMSettings]:
+    store = get_store()
+    config = get_default_config()
     stats = store.get_stats()
+    live_summary = store.get_live_evaluation_summary(limit=200)
     ini_settings = load_llm_settings_from_ini()
 
     with st.sidebar:
-        st.title("评测控制台")
-        st.caption("主问答窗口已迁移到 PySide6；这里仅保留 benchmark 编辑、索引重建和评测结果。")
-        st.write(f"知识库文档数：`{stats.documents}`")
-        st.write(f"知识库 chunks：`{stats.chunks}`")
+        st.title("实时评测控制台")
+        st.caption("主问答窗口在 PySide6；这里展示真实问答的实时评测结果。")
+        st.write(f"文档数：`{stats.documents}`")
+        st.write(f"Chunk 数：`{stats.chunks}`")
         st.write(f"SQLite：`{config.sqlite_path}`")
         st.write(f"向量索引：`{config.faiss_path}`")
-        st.write(f"Benchmark：`{HARNESS_BENCHMARK_PATH}`")
-        st.write(f"报告：`{HARNESS_REPORT_PATH}`")
+        st.write(f"已评测：`{live_summary['evaluated']}`")
+        st.write(f"待评测：`{live_summary['pending']}`")
+        st.write(f"评测中：`{live_summary.get('processing', 0)}`")
+        total = live_summary["evaluated"] + live_summary["pending"] + live_summary.get("processing", 0)
+        st.write(f"评测覆盖率：`{(live_summary['evaluated'] / max(total, 1)) * 100:.1f}%`")
+        st.write(f"当前模型：`{ini_settings.model or '-'}`")
+        st.write(f"当前模式：`{ini_settings.retrieval_mode}`")
+
+        auto_refresh = st.checkbox("监听新记录后刷新", value=True)
+        st.caption(f"检测间隔：{LIVE_POLL_SECONDS}s；仅检测到新记录或评测状态变化时刷新。")
 
         if st.button("重建索引", width="stretch"):
             with st.spinner("正在重建知识库索引..."):
                 message = rebuild_knowledge_base()
             st.success(message)
 
-        st.subheader("评测模式")
-        selected_modes: list[str] = []
-        for mode in HARNESS_MODES:
-            if st.checkbox(mode, value=True, key=f"mode_{mode}"):
-                selected_modes.append(mode)
-        show_case_details = st.checkbox("显示失败样例", value=True)
-
-        st.subheader("LLM 配置")
-        retrieval_mode = st.selectbox(
-            "默认问答模式",
-            options=["llm_retrieval", "hybrid"],
-            index=0 if ini_settings.retrieval_mode == "llm_retrieval" else 1,
-            disabled=True,
-            help="评测时按选择的 mode 覆盖；这里仅展示当前默认配置。",
-        )
-        base_url = st.text_input("Base URL", value=ini_settings.base_url)
-        api_key = st.text_input("API Key", value=ini_settings.api_key, type="password")
-        model = st.text_input("Model", value=ini_settings.model)
-        current_settings = LLMSettings(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            temperature=ini_settings.temperature,
-            max_tokens=ini_settings.max_tokens,
-            retrieval_mode=retrieval_mode,
-            answer_profile="quality",
-        )
-        if current_settings.disabled_reason:
-            st.warning(current_settings.disabled_reason)
-
-        if st.button("运行回归评测", width="stretch"):
-            if not selected_modes:
-                st.error("至少选择一个评测模式。")
-            elif current_settings.disabled_reason:
-                st.error(f"无法运行评测：{current_settings.disabled_reason}")
-            else:
-                with st.spinner("正在运行回归评测..."):
-                    result = run_harness(selected_modes, current_settings)
-                st.session_state.harness_last_run = result
-                if result["exit_code"] == 0:
-                    st.success("评测完成，结果已刷新。")
-                else:
-                    st.error(f"评测失败，退出码：{result['exit_code']}")
-
-    return current_settings, show_case_details
-
-
-def render_benchmark_editor() -> None:
-    st.subheader("Benchmark 编辑")
-    st.caption("这里的内容就是评测固定文本。修改后保存，再运行回归评测。")
-    st.caption(f"文件位置：`{HARNESS_BENCHMARK_PATH}`")
-
-    if "benchmark_editor_text" not in st.session_state:
-        st.session_state.benchmark_editor_text = load_benchmark_text()
-
-    editor_cols = st.columns([1, 1, 4])
-    with editor_cols[0]:
-        if st.button("重新加载 Benchmark", width="stretch"):
-            st.session_state.benchmark_editor_text = load_benchmark_text()
+        if st.button("补评历史问答", width="stretch"):
+            with st.spinner("正在补评未完成的历史问答..."):
+                result = backfill_pending_live_evaluations(limit=100)
+            st.success(f"已处理 {result['processed']} 条，剩余待评测 {result['pending']} 条。")
             st.rerun()
-    with editor_cols[1]:
-        if st.button("保存 Benchmark", width="stretch"):
-            try:
-                save_benchmark_text(st.session_state.benchmark_editor_text)
-            except Exception as exc:
-                st.error(f"保存失败：{exc}")
-            else:
-                st.success("Benchmark 已保存。")
-    st.text_area(
-        "legal_qa_benchmark.json",
-        key="benchmark_editor_text",
-        height=360,
+
+    return auto_refresh, ini_settings
+
+
+def render_summary_cards(live_summary: dict[str, float | int]) -> None:
+    total = int(live_summary["evaluated"]) + int(live_summary["pending"]) + int(live_summary.get("processing", 0))
+    coverage = int(live_summary["evaluated"]) / max(total, 1)
+    cols = st.columns(6)
+    cols[0].metric("已评测", f"{int(live_summary['evaluated'])}")
+    cols[1].metric("待评测", f"{int(live_summary['pending'])}")
+    cols[2].metric("评测中", f"{int(live_summary.get('processing', 0))}")
+    cols[3].metric("覆盖率", f"{coverage * 100:.1f}%")
+    cols[4].metric("整体得分", f"{float(live_summary['overall_score']) * 100:.1f}%")
+    cols[5].metric("通过率", f"{float(live_summary['pass_rate']) * 100:.1f}%")
+
+    subcols = st.columns(3)
+    subcols[0].caption(
+        f"引用关联：{float(live_summary['citation_link_score']) * 100:.1f}%  |  "
+        f"关键词重叠：{float(live_summary['question_answer_overlap_score']) * 100:.1f}%"
     )
+    subcols[1].caption(f"候选关联：{float(live_summary['retrieval_support_score']) * 100:.1f}%")
+    subcols[2].caption(f"答案长度：{float(live_summary['answer_length_score']) * 100:.1f}%")
 
 
-def render_harness_dashboard(show_case_details: bool) -> None:
-    st.subheader("评测结果")
-    report = load_harness_report()
-    if report is None:
-        st.info("还没有评测报告。先运行一次回归评测。")
+def render_recent_evaluations(show_details: bool) -> None:
+    store = get_store()
+    recent_rows = store.list_recent_live_evaluations(limit=25)
+    if not recent_rows:
+        st.info("当前还没有实时评测记录。先在 PySide6 里发一轮问题，或点击“补评历史问答”。")
         return
 
-    st.caption(f"报告文件：`{HARNESS_REPORT_PATH}`")
-    requested_modes = report.get("requested_modes") or []
-    if requested_modes:
-        st.write("模式对比：`" + "` / `".join(requested_modes) + "`")
+    table_rows = []
+    for row in recent_rows:
+        table_rows.append(
+            {
+                "turn": row["turn_id"],
+                "scope": row["conversation_scope"],
+                "mode": row["retrieval_mode"],
+                "status": row["status"],
+                "score": f"{float(row['overall_score']) * 100:.1f}%",
+                "overlap": f"{float(row['question_answer_overlap_score']) * 100:.1f}%",
+                "citation": f"{float(row['citation_link_score']) * 100:.1f}%",
+                "retrieval": f"{float(row['retrieval_support_score']) * 100:.1f}%",
+                "issues": row["issue_count"],
+                "updated": row["updated_at"],
+            }
+        )
 
-    last_run = st.session_state.get("harness_last_run")
-    if last_run:
-        with st.expander("最近一次评测日志", expanded=False):
-            st.code(last_run.get("stdout", "") or "(无输出)", language="text")
-            if last_run.get("stderr"):
-                st.code(last_run["stderr"], language="text")
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-    skipped_modes = report.get("skipped_modes") or []
-    for item in skipped_modes:
-        st.warning(f"已跳过 {item.get('mode', '')}：{item.get('reason', '')}")
+    if show_details:
+        st.subheader("最近问答详情")
+        for row in recent_rows[:8]:
+            with st.expander(f"turn {row['turn_id']} · {row['conversation_scope']} · {float(row['overall_score']) * 100:.1f}%", expanded=False):
+                st.write(f"问题：{row['question']}")
+                st.write(f"答案：{row['answer']}")
+                st.caption(
+                    " | ".join(
+                        [
+                            f"模式：{row['retrieval_mode']}",
+                            f"候选证据：{len(row['retrieved_chunks'])}",
+                            f"引用证据：{len(row['citations'])}",
+                            f"问题-答案重叠：{float(row['question_answer_overlap_score']) * 100:.1f}%",
+                            f"引用关联：{float(row['citation_link_score']) * 100:.1f}%",
+                            f"综合得分：{float(row['overall_score']) * 100:.1f}%",
+                        ]
+                    )
+                )
+                if row["summary"]:
+                    st.info(row["summary"])
+                if row["issues"]:
+                    for issue in row["issues"]:
+                        st.warning(issue)
 
-    for mode_report in report.get("modes", []):
-        mode_name = str(mode_report.get("mode", ""))
-        metrics = mode_report.get("metrics", {}) or {}
-        with st.expander(f"{mode_name} 指标", expanded=True):
-            metric_cols = st.columns(6)
-            metric_cols[0].metric("检索命中率", format_rate(metrics.get("retrieval_hit_rate")))
-            metric_cols[1].metric("证据筛选命中率", format_rate(metrics.get("evidence_selection_hit_rate")))
-            metric_cols[2].metric("引用准确率", format_rate(metrics.get("citation_hit_rate")))
-            metric_cols[3].metric("答案合规率", format_rate(metrics.get("answer_pass_rate")))
-            metric_cols[4].metric("平均耗时", f"{float(metrics.get('avg_latency_ms', 0.0)):.0f} ms")
-            metric_cols[5].metric("综合通过率", format_rate(metrics.get("overall_pass_rate")))
 
-            summary_cols = st.columns(3)
-            summary_cols[0].caption(f"检索覆盖：{format_rate(metrics.get('retrieval_reference_coverage'))}")
-            summary_cols[1].caption(
-                f"证据筛选覆盖：{format_rate(metrics.get('evidence_selection_reference_coverage'))}"
+def render_mode_compare_section(ini_settings: LLMSettings) -> None:
+    store = get_store()
+    config = get_default_config()
+    st.subheader("同题模式对比")
+    st.caption("输入同一个法律问题，分别运行 `hybrid` 和 `llm_retrieval`，同时比较 token 消耗与实时评测分。")
+
+    default_question = st.session_state.get("mode_compare_question", "")
+    with st.form("mode_compare_form", clear_on_submit=False):
+        question = st.text_area(
+            "待对比问题",
+            value=default_question,
+            height=140,
+            placeholder="例如：我方当事人按期交货后，对方以质量问题拒付尾款并单方解除合同，应如何应对？",
+        )
+        top_k = st.number_input(
+            "候选上限",
+            min_value=1,
+            max_value=12,
+            value=int(config.final_top_k),
+            step=1,
+        )
+        submitted = st.form_submit_button("开始对比")
+
+    if not submitted and "mode_compare_report" not in st.session_state:
+        return
+
+    if submitted:
+        question = " ".join(question.split()).strip()
+        if not question:
+            st.error("请先输入一个法律问题。")
+            return
+        st.session_state["mode_compare_question"] = question
+        agent = LegalRAGAgent(store=store, config=config)
+        try:
+            with st.spinner("正在分别运行 hybrid 与 llm_retrieval，并统计 token 与效果指标..."):
+                report = compare_retrieval_modes(
+                    agent=agent,
+                    question=question,
+                    llm_settings=ini_settings,
+                    report_dir=APP_DIR / "eval" / "reports",
+                    top_k=int(top_k),
+                )
+        except Exception as exc:
+            st.error(str(exc))
+            return
+        st.session_state["mode_compare_report"] = report
+        st.success(f"对比完成，报告已保存到 `{report.get('report_path', '-')}`")
+
+    report = st.session_state.get("mode_compare_report")
+    if not report:
+        return
+
+    comparison = report["comparison"]
+    mode_results = report["mode_results"]
+
+    summary_cols = st.columns(6)
+    summary_cols[0].metric("token 差值", f"{comparison['token_delta_total']:+d}")
+    summary_cols[1].metric("score 差值", f"{comparison['score_delta']:+.4f}")
+    summary_cols[2].metric("赢家(效果)", comparison["winner_by_score"])
+    summary_cols[3].metric("赢家(token)", comparison["winner_by_tokens"])
+    summary_cols[4].metric("赢家(耗时)", comparison["winner_by_latency"])
+    summary_cols[5].metric("总耗时差", f"{comparison['elapsed_delta_seconds']:+.3f}s")
+
+    rows = []
+    for mode in ("hybrid", "llm_retrieval"):
+        item = mode_results[mode]
+        rows.append(
+            {
+                "mode": mode,
+                "prompt_tokens": int(item["token_usage"]["prompt_tokens"]),
+                "completion_tokens": int(item["token_usage"]["completion_tokens"]),
+                "total_tokens": int(item["token_usage"]["total_tokens"]),
+                "llm_calls": int(item["token_usage"]["llm_calls"]),
+                "elapsed_seconds": float(item["elapsed_seconds"]),
+                "overall_score": float(item["overall_score"]),
+                "overlap": float(item["question_answer_overlap_score"]),
+                "retrieval_support": float(item["retrieval_support_score"]),
+                "citation_link": float(item["citation_link_score"]),
+                "answer_length": float(item["answer_length_score"]),
+                "retrieved_chunks": int(item["retrieved_chunk_count"]),
+                "citations": int(item["citation_count"]),
+                "pass": bool(item["pass"]),
+            }
+        )
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    for mode in ("hybrid", "llm_retrieval"):
+        item = mode_results[mode]
+        with st.expander(f"{mode} 详情 · 得分 {float(item['overall_score']) * 100:.1f}% · token {int(item['token_usage']['total_tokens'])}", expanded=False):
+            detail_cols = st.columns(4)
+            detail_cols[0].metric("prompt tokens", f"{int(item['token_usage']['prompt_tokens'])}")
+            detail_cols[1].metric("completion tokens", f"{int(item['token_usage']['completion_tokens'])}")
+            detail_cols[2].metric("总 token", f"{int(item['token_usage']['total_tokens'])}")
+            detail_cols[3].metric("耗时", f"{float(item['elapsed_seconds']):.2f}s")
+            st.caption(
+                " | ".join(
+                    [
+                        f"整体得分：{float(item['overall_score']) * 100:.1f}%",
+                        f"关键词重叠：{float(item['question_answer_overlap_score']) * 100:.1f}%",
+                        f"引用关联：{float(item['citation_link_score']) * 100:.1f}%",
+                        f"候选关联：{float(item['retrieval_support_score']) * 100:.1f}%",
+                        f"通过：{'是' if item['pass'] else '否'}",
+                    ]
+                )
             )
-            summary_cols[2].caption(f"引用覆盖：{format_rate(metrics.get('citation_reference_coverage'))}")
-
-            case_results = mode_report.get("cases", []) or []
-            failed_cases = [case for case in case_results if not case.get("case_pass")]
-            st.caption(f"样本数：{len(case_results)}，失败样例：{len(failed_cases)}")
-
-            if show_case_details and failed_cases:
-                for case in failed_cases:
-                    with st.expander(case.get("id", "未命名样例"), expanded=False):
-                        st.write(f"问题：{case.get('question', '')}")
-                        for reason in case.get("fail_reasons", []):
-                            st.write(f"- {reason}")
-                        preview = case.get("result_preview", {}) or {}
-                        answer_preview = str(preview.get("answer", "") or "").strip()
-                        if answer_preview:
-                            st.code(answer_preview, language="text")
+            if item.get("summary"):
+                st.info(item["summary"])
+            if item.get("issues"):
+                for issue in item["issues"]:
+                    st.warning(issue)
+            st.markdown("**回答**")
+            st.markdown(item["answer"] or "_空_")
+            if item.get("retrieved_chunks"):
+                st.markdown("**候选证据**")
+                for idx, chunk in enumerate(item["retrieved_chunks"][:5], start=1):
+                    source_name = chunk.get("source_name", "")
+                    text = str(chunk.get("text", "")).strip()
+                    st.write(f"[{idx}] {source_name}")
+                    st.caption(text[:300])
 
 
 def main() -> None:
-    _, show_case_details = render_sidebar()
-    st.title("法律 RAG 评测面板")
-    st.caption("主问答窗口请通过 PySide6 桌面版启动；这里仅负责 benchmark 编辑、索引重建和评测结果展示。")
-    render_benchmark_editor()
-    render_harness_dashboard(show_case_details)
+    auto_refresh, ini_settings = render_sidebar()
+    store = get_store()
+    live_summary = store.get_live_evaluation_summary(limit=200)
+    sync_live_update_token(store)
+
+    st.title("法律 RAG 实时评测面板")
+    st.caption("页面直接读取 PySide6 产生的真实问答记录；后台轮询 SQLite 变更标识，仅在出现新记录或评测状态变化时刷新。")
+    render_live_update_watcher(auto_refresh)
+
+    render_summary_cards(live_summary)
+    render_mode_compare_section(ini_settings)
+    st.subheader("最新实时评测")
+    render_recent_evaluations(show_details=True)
 
 
 if __name__ == "__main__":
